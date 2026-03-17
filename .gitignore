@@ -1,0 +1,27 @@
+# Claude
+.claude/
+
+# Dependencies
+node_modules/
+
+# Build
+dist/
+
+# Example builds
+example/node_modules/
+example/RiviumExampleApp/node_modules/
+example/RiviumExampleApp/ios/Pods/
+example/RiviumExampleApp/ios/build/
+example/RiviumExampleApp/android/build/
+example/RiviumExampleApp/android/app/build/
+example/RiviumExampleApp/android/.gradle/
+
+# OS
+.DS_Store
+*.swp
+*~
+
+# IDE
+.idea/
+.vscode/
+*.sublime-*
