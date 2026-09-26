@@ -1,6 +1,16 @@
 export interface RiviumAbTestingConfig {
   /** API key for authentication (format: rv_live_xxx or rv_test_xxx) */
   apiKey: string;
+  /**
+   * Returns a Rivium user token for the signed-in user, minted by YOUR server
+   * (POST https://auth.rivium.co/users/token with your server secret). The
+   * service then takes the user from the token instead of trusting the userId
+   * this app sends. Called when a token is needed and again shortly before it
+   * expires. Required for assigning variants, tracking events and evaluating flags.
+   */
+  tokenProvider?: () => string | Promise<string>;
+  /** A user token you already hold. `tokenProvider` is preferred: a static token expires. */
+  userToken?: string;
   debug?: boolean;
   flushInterval?: number;
   maxQueueSize?: number;

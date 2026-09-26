@@ -1,9 +1,37 @@
-import AsyncStorage from '@react-native-async-storage/async-storage';
 import { AppState, type AppStateStatus } from 'react-native';
+import { Storage } from './storage';
 import { createHash } from './hash';
 
 const API_URL = 'https://abtest.rivium.co';
-const STORAGE_PREFIX = 'rivium_ab_testing_';
+const SDK_VERSION = '0.2.0';
+/** Fetch a new user token this many seconds before the current one expires. */
+const TOKEN_REFRESH_SKEW_S = 60;
+
+const BASE64_ALPHABET = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/';
+
+/** base64url -> text, without atob (absent on older React Native engines). */
+function base64UrlDecode(input: string): string {
+  const b64 = input.replace(/-/g, '+').replace(/_/g, '/').replace(/=+$/, '');
+  let bits = 0;
+  let value = 0;
+  let out = '';
+  for (const ch of b64) {
+    const index = BASE64_ALPHABET.indexOf(ch);
+    if (index < 0) throw new Error('invalid base64');
+    value = (value << 6) | index;
+    bits += 6;
+    if (bits >= 8) {
+      bits -= 8;
+      out += String.fromCharCode((value >> bits) & 0xff);
+    }
+  }
+  // The token payload is JSON; decode its UTF-8 bytes.
+  try {
+    return decodeURIComponent(escape(out));
+  } catch {
+    return out;
+  }
+}
 
 // ============================================
 // TYPES & INTERFACES
@@ -12,6 +40,17 @@ const STORAGE_PREFIX = 'rivium_ab_testing_';
 export interface RiviumAbTestingConfig {
   /** API key for authentication (format: rv_live_xxx or rv_test_xxx) */
   apiKey: string;
+  /**
+   * Returns a Rivium user token for the signed-in user, minted by YOUR server
+   * (POST https://auth.rivium.co/users/token with your server secret). The
+   * service then takes the user from the token instead of trusting the
+   * userId this app sends. Called when a token is needed and again shortly
+   * before it expires. Required for
+   * assigning variants, tracking events and evaluating flags.
+   */
+  tokenProvider?: () => string | Promise<string>;
+  /** A user token you already hold. `tokenProvider` is preferred: a static token expires. */
+  userToken?: string;
   debug?: boolean;
   flushInterval?: number;
   maxQueueSize?: number;
@@ -62,25 +101,20 @@ export interface FlagVariant {
 }
 
 export enum EventType {
-  // Core events
   VIEW = 'view',
   CLICK = 'click',
   CONVERSION = 'conversion',
   CUSTOM = 'custom',
-  // Engagement events
   SCROLL = 'scroll',
   FORM_SUBMIT = 'form_submit',
   SEARCH = 'search',
   SHARE = 'share',
-  // E-commerce events
   ADD_TO_CART = 'add_to_cart',
   REMOVE_FROM_CART = 'remove_from_cart',
   BEGIN_CHECKOUT = 'begin_checkout',
   PURCHASE = 'purchase',
-  // Media events
   VIDEO_START = 'video_start',
   VIDEO_COMPLETE = 'video_complete',
-  // User events
   SIGN_UP = 'sign_up',
   LOGIN = 'login',
   LOGOUT = 'logout',
@@ -124,15 +158,18 @@ interface CachedAssignment {
   experimentId: string;
   variantId: string;
   variantName: string;
+  config?: Record<string, any>;
   assignedAt: string;
 }
 
 interface CachedExperiment {
   id: string;
+  key?: string;
   name: string;
   trafficAllocation: number;
   variants: {
     id: string;
+    key?: string;
     name: string;
     config?: Record<string, any>;
     isControl: boolean;
@@ -175,6 +212,11 @@ class RiviumAbTestingSDK {
 
   private appStateSubscription: ReturnType<typeof AppState.addEventListener> | null = null;
 
+  // User token (see RiviumAbTestingConfig.tokenProvider)
+  private userToken?: string;
+  private userTokenExpiresAt = 0;
+  private userTokenInFlight?: Promise<string | undefined>;
+
   // ============================================
   // INITIALIZATION
   // ============================================
@@ -189,7 +231,8 @@ class RiviumAbTestingSDK {
 
     // Start sync timer
     const interval = config.flushInterval || 30000;
-    this.syncConfig.syncIntervalSeconds = Math.floor(interval / 1000);
+    this.syncConfig.syncIntervalSeconds = Math.max(1, Math.floor(interval / 1000));
+    if (config.maxQueueSize) this.syncConfig.maxOfflineEvents = config.maxQueueSize;
     this.startSyncTimer();
 
     // Listen for app state changes to flush on background
@@ -212,8 +255,19 @@ class RiviumAbTestingSDK {
 
   async setUserId(userId: string): Promise<void> {
     this.ensureInitialized();
+    if (userId !== this.userId) {
+      // Send the last user's pending events while their token still applies.
+      if (this.userId && this.eventQueue.length > 0) {
+        await this.syncEvents().catch(() => {});
+      }
+      // Another person now (a login, a logout, a shared computer): the last
+      // user's variants, attributes and token are not theirs.
+      await this.clearAssignments();
+      this.userAttributes = {};
+      this.clearUserToken();
+    }
     this.userId = userId;
-    await AsyncStorage.setItem(`${STORAGE_PREFIX}user_id`, userId);
+    await Storage.setItem('user_id', userId);
   }
 
   async getUserId(): Promise<string | null> {
@@ -245,43 +299,44 @@ class RiviumAbTestingSDK {
 
     // Try server assignment
     try {
-      const response = await fetch(`${API_URL}/public/assign`, {
+      const response = await this.request('/public/assign', {
         method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          'x-api-key': this.config!.apiKey,
-        },
         body: JSON.stringify({
-          experimentId: experimentKey,
+          experimentKey,
           userId: this.userId,
-          context: this.userAttributes,
+          ...(Object.keys(this.userAttributes).length > 0
+            ? { userAttributes: this.userAttributes }
+            : {}),
         }),
       });
 
       if (response.ok) {
-        const data = await response.json();
-        const variantName = data.variantName as string;
+        const body = await response.json();
+        const data = (body?.data ?? {}) as Record<string, any>;
+        const variantName = (data.variantName as string) || (data.variantKey as string);
 
-        // Cache assignment
-        await this.cacheAssignment({
-          experimentId: experimentKey,
-          variantId: data.variantId,
-          variantName,
-          assignedAt: new Date().toISOString(),
-        });
+        if (variantName) {
+          await this.cacheAssignment(experimentKey, {
+            experimentId: data.experimentId as string,
+            variantId: data.variantId as string,
+            variantName,
+            config: data.config as Record<string, any> | undefined,
+            assignedAt: new Date().toISOString(),
+          });
 
-        this.emit('experimentAssigned', {
-          experimentKey,
-          variantKey: variantName,
-          config: data.config,
-        });
+          this.emit('experimentAssigned', {
+            experimentKey,
+            variantKey: variantName,
+            config: data.config,
+          });
 
-        return variantName;
+          return variantName;
+        }
+      } else {
+        this.debugLog(`Assignment for ${experimentKey} refused: HTTP ${response.status}`);
       }
     } catch (e) {
-      if (this.config?.debug) {
-        console.log('RiviumAbTesting: Failed to get assignment from server:', e);
-      }
+      this.debugLog('Failed to get assignment from server:', e);
     }
 
     // Offline fallback: local bucketing
@@ -293,39 +348,18 @@ class RiviumAbTestingSDK {
   ): Promise<Record<string, any> | null> {
     this.ensureInitialized();
 
-    try {
-      const response = await fetch(
-        `${API_URL}/public/variant-config?experimentId=${experimentKey}&userId=${this.userId}`,
-        {
-          headers: { 'x-api-key': this.config!.apiKey },
-        }
-      );
-
-      if (response.ok) {
-        const data = await response.json();
-        return data.config || null;
-      }
-    } catch (e) {
-      if (this.config?.debug) {
-        console.log('RiviumAbTesting: Failed to get variant config:', e);
-      }
+    // The assignment carries the variant's config; make sure there is one.
+    let cached = await this.getCachedAssignment(experimentKey);
+    if (!cached && this.userId) {
+      await this.getVariant(experimentKey);
+      cached = await this.getCachedAssignment(experimentKey);
     }
+    if (!cached) return null;
+    if (cached.config) return cached.config;
 
-    // Fallback to cached
-    const experiment = this.cachedExperiments.find(
-      (exp) => exp.id === experimentKey || exp.name === experimentKey
-    );
-    if (experiment) {
-      const cached = await this.getCachedAssignment(experimentKey);
-      if (cached) {
-        const variant = experiment.variants.find(
-          (v) => v.id === cached.variantId
-        );
-        return variant?.config || null;
-      }
-    }
-
-    return null;
+    const experiment = this.findExperiment(experimentKey);
+    const variant = experiment?.variants.find((v) => v.id === cached!.variantId);
+    return variant?.config || null;
   }
 
   // ============================================
@@ -593,13 +627,13 @@ class RiviumAbTestingSDK {
     this.ensureInitialized();
     return this.cachedExperiments.map((e) => ({
       id: e.id,
-      key: e.id,
+      key: e.key || e.id,
       name: e.name,
       status: 'running' as const,
       trafficAllocation: e.trafficAllocation,
       variants: e.variants.map((v) => ({
         id: v.id,
-        key: v.id,
+        key: v.key || v.id,
         name: v.name,
         trafficSplit: v.trafficSplit,
         isControl: v.isControl,
@@ -619,12 +653,8 @@ class RiviumAbTestingSDK {
     this.ensureInitialized();
 
     try {
-      const response = await fetch(`${API_URL}/public/flag-evaluation`, {
+      const response = await this.request('/public/flag-evaluation', {
         method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          'x-api-key': this.config!.apiKey,
-        },
         body: JSON.stringify({
           flagKey: featureKey,
           userId: this.userId || '',
@@ -634,7 +664,7 @@ class RiviumAbTestingSDK {
 
       if (response.ok) {
         const data = await response.json();
-        return data.enabled ?? defaultValue;
+        return (data.enabled as boolean) ?? defaultValue;
       }
     } catch (e) {
       if (this.config?.debug) {
@@ -652,12 +682,8 @@ class RiviumAbTestingSDK {
     this.ensureInitialized();
 
     try {
-      const response = await fetch(`${API_URL}/public/flag-evaluation`, {
+      const response = await this.request('/public/flag-evaluation', {
         method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          'x-api-key': this.config!.apiKey,
-        },
         body: JSON.stringify({
           flagKey: featureKey,
           userId: this.userId || '',
@@ -682,9 +708,7 @@ class RiviumAbTestingSDK {
     this.ensureInitialized();
 
     try {
-      const response = await fetch(`${API_URL}/public/flags`, {
-        headers: { 'x-api-key': this.config!.apiKey },
-      });
+      const response = await this.request('/public/flags');
 
       if (response.ok) {
         const data = await response.json();
@@ -703,9 +727,7 @@ class RiviumAbTestingSDK {
     this.ensureInitialized();
 
     try {
-      const response = await fetch(`${API_URL}/public/flags`, {
-        headers: { 'x-api-key': this.config!.apiKey },
-      });
+      const response = await this.request('/public/flags');
 
       if (response.ok) {
         const data = await response.json();
@@ -735,6 +757,7 @@ class RiviumAbTestingSDK {
       clearInterval(this.syncTimer);
       this.syncTimer = null;
     }
+
     this.appStateSubscription?.remove();
     this.appStateSubscription = null;
 
@@ -743,12 +766,12 @@ class RiviumAbTestingSDK {
     this.cachedExperiments = [];
     this.eventQueue = [];
     this.isInitialized = false;
+    this.clearUserToken();
 
     // Clear persisted state
-    const keys = await AsyncStorage.getAllKeys();
-    const riviumKeys = keys.filter((k: string) => k.startsWith(STORAGE_PREFIX));
-    if (riviumKeys.length > 0) {
-      await AsyncStorage.multiRemove(riviumKeys);
+    const keys = await Storage.getAllKeys();
+    if (keys.length > 0) {
+      await Storage.multiRemove(keys);
     }
   }
 
@@ -810,16 +833,19 @@ class RiviumAbTestingSDK {
 
   private async loadPersistedState(): Promise<void> {
     try {
-      const [userId, experiments, events] = await AsyncStorage.multiGet([
-        `${STORAGE_PREFIX}user_id`,
-        `${STORAGE_PREFIX}experiments`,
-        `${STORAGE_PREFIX}events`,
+      const results = await Storage.multiGet([
+        'user_id',
+        'experiments',
+        'events',
       ]);
 
-      if (userId[1]) this.userId = userId[1];
-      if (experiments[1])
-        this.cachedExperiments = JSON.parse(experiments[1]);
-      if (events[1]) this.eventQueue = JSON.parse(events[1]);
+      const userId = results[0][1];
+      const experiments = results[1][1];
+      const events = results[2][1];
+
+      if (userId) this.userId = userId;
+      if (experiments) this.cachedExperiments = JSON.parse(experiments);
+      if (events) this.eventQueue = JSON.parse(events);
     } catch (e) {
       if (this.config?.debug) {
         console.log('RiviumAbTesting: Failed to load persisted state:', e);
@@ -829,36 +855,131 @@ class RiviumAbTestingSDK {
 
   private async persistEvents(): Promise<void> {
     try {
-      await AsyncStorage.setItem(
-        `${STORAGE_PREFIX}events`,
-        JSON.stringify(this.eventQueue)
-      );
-    } catch (e) {
+      await Storage.setItem('events', JSON.stringify(this.eventQueue));
+    } catch {
       // Silently fail
     }
   }
 
   private async getCachedAssignment(
-    experimentId: string
+    experimentKey: string
   ): Promise<CachedAssignment | null> {
     try {
-      const raw = await AsyncStorage.getItem(
-        `${STORAGE_PREFIX}assignment_${experimentId}`
-      );
+      const raw = await Storage.getItem(`assignment_${experimentKey}`);
       return raw ? JSON.parse(raw) : null;
     } catch {
       return null;
     }
   }
 
-  private async cacheAssignment(assignment: CachedAssignment): Promise<void> {
+  private async cacheAssignment(
+    experimentKey: string,
+    assignment: CachedAssignment
+  ): Promise<void> {
     try {
-      await AsyncStorage.setItem(
-        `${STORAGE_PREFIX}assignment_${assignment.experimentId}`,
-        JSON.stringify(assignment)
-      );
+      await Storage.setItem(`assignment_${experimentKey}`, JSON.stringify(assignment));
     } catch {
       // Silently fail
+    }
+  }
+
+  private async clearAssignments(): Promise<void> {
+    const prefix = Storage.fullKey('assignment_');
+    const keys = (await Storage.getAllKeys()).filter((k) => k.startsWith(prefix));
+    if (keys.length > 0) {
+      await Storage.multiRemove(keys);
+    }
+  }
+
+  private findExperiment(experimentKey: string): CachedExperiment | undefined {
+    return this.cachedExperiments.find(
+      (e) => e.key === experimentKey || e.id === experimentKey
+    );
+  }
+
+  private debugLog(message: string, detail?: unknown): void {
+    if (this.config?.debug) {
+      if (detail === undefined) console.log(`RiviumAbTesting: ${message}`);
+      else console.log(`RiviumAbTesting: ${message}`, detail);
+    }
+  }
+
+  // ============================================
+  // PRIVATE: REQUESTS & USER TOKEN
+  // ============================================
+
+  /**
+   * Every call to the service goes through here: API key, user token, and
+   * one retry with a fresh token when the service says the token expired.
+   */
+  private async request(path: string, init: RequestInit = {}, retry = true): Promise<Response> {
+    const headers: Record<string, string> = {
+      'Content-Type': 'application/json',
+      'x-api-key': this.config!.apiKey,
+    };
+    const token = await this.getUserToken();
+    if (token) {
+      headers['x-user-token'] = token;
+    }
+
+    const response = await fetch(`${API_URL}${path}`, { ...init, headers });
+
+    if (response.status === 401 && retry && (this.config?.tokenProvider || this.config?.userToken)) {
+      const body = await response.clone().json().catch(() => null);
+      if (body?.code === 'token_expired' && this.config?.tokenProvider) {
+        this.clearUserToken();
+        return this.request(path, init, false);
+      }
+      if (body?.code) {
+        this.emit('error', { message: `User token rejected: ${body.code}`, code: body.code });
+      }
+    }
+    return response;
+  }
+
+  /** The current user token, fetched through tokenProvider when needed. */
+  private async getUserToken(): Promise<string | undefined> {
+    if (this.config?.userToken) return this.config.userToken;
+    if (!this.config?.tokenProvider) return undefined;
+
+    const nowS = Math.floor(Date.now() / 1000);
+    if (this.userToken && this.userTokenExpiresAt - TOKEN_REFRESH_SKEW_S > nowS) {
+      return this.userToken;
+    }
+    if (this.userTokenInFlight) return this.userTokenInFlight;
+
+    this.userTokenInFlight = (async () => {
+      try {
+        const token = await this.config!.tokenProvider!();
+        this.userToken = token;
+        this.userTokenExpiresAt = this.tokenExpiry(token);
+        return token;
+      } catch (e) {
+        this.debugLog('tokenProvider failed:', e);
+        return this.userToken;
+      } finally {
+        this.userTokenInFlight = undefined;
+      }
+    })();
+    return this.userTokenInFlight;
+  }
+
+  private usesUserToken(): boolean {
+    return !!(this.config?.tokenProvider || this.config?.userToken);
+  }
+
+  private clearUserToken(): void {
+    this.userToken = undefined;
+    this.userTokenExpiresAt = 0;
+  }
+
+  /** `exp` from the token's payload; 0 (refetch next time) if unreadable. */
+  private tokenExpiry(token: string): number {
+    try {
+      const json = JSON.parse(base64UrlDecode(token.split('.')[1]));
+      return typeof json.exp === 'number' ? json.exp : 0;
+    } catch {
+      return 0;
     }
   }
 
@@ -933,14 +1054,20 @@ class RiviumAbTestingSDK {
     this.isSyncing = true;
 
     try {
+      // With a user token the service credits every event in the batch to
+      // the token's user, so another user's leftover events cannot be sent
+      // under it - they would be credited to the wrong person.
+      if (this.usesUserToken()) {
+        const before = this.eventQueue.length;
+        this.eventQueue = this.eventQueue.filter((e) => e.userId === this.userId);
+        if (this.eventQueue.length !== before) await this.persistEvents();
+        if (this.eventQueue.length === 0) return;
+      }
+
       const batch = this.eventQueue.slice(0, this.syncConfig.maxBatchSize);
 
-      const response = await fetch(`${API_URL}/public/sync`, {
+      const response = await this.request('/public/sync', {
         method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          'x-api-key': this.config!.apiKey,
-        },
         body: JSON.stringify({
           events: batch.map((e) => ({
             experimentId: e.experimentId,
@@ -953,37 +1080,33 @@ class RiviumAbTestingSDK {
             timestamp: e.timestamp,
             clientEventId: e.id,
           })),
-          sdkVersion: 'react-native-0.1.0',
+          sdkVersion: `react-native-${SDK_VERSION}`,
         }),
       });
 
       if (response.ok) {
         const result = await response.json();
-        const synced = result.synced || 0;
-
-        // Remove synced events
-        this.eventQueue.splice(0, synced);
-
-        // Increment retry count for failed events
-        const failed = result.failed || 0;
-        if (failed > 0) {
-          for (let i = 0; i < Math.min(failed, this.eventQueue.length); i++) {
-            this.eventQueue[i].retryCount++;
-            if (this.eventQueue[i].retryCount >= this.syncConfig.maxRetries) {
-              this.eventQueue.splice(i, 1);
-              i--;
-            }
-          }
-        }
-
+        // The service has taken the whole batch. Events it could not record
+        // (an experiment that no longer exists, say) would fail again, so
+        // they are not retried.
+        this.eventQueue.splice(0, batch.length);
         await this.persistEvents();
 
         this.emit('syncCompleted', {
-          synced,
-          failed,
+          synced: (result.synced as number) || 0,
+          failed: (result.failed as number) || 0,
           pending: this.eventQueue.length,
         });
+      } else if (response.status === 401) {
+        // No valid user token yet : keep the
+        // events and send them once a token is available.
+      } else if (response.status >= 400 && response.status < 500 && response.status !== 429) {
+        // The request itself is wrong; the same events cannot succeed.
+        this.eventQueue.splice(0, batch.length);
+        await this.persistEvents();
+        this.emit('error', { message: `Sync refused: HTTP ${response.status}` });
       }
+      // 429 and 5xx: keep the events and try again on the next tick.
     } catch (e) {
       this.emit('error', { message: `Sync failed: ${e}` });
     } finally {
@@ -997,40 +1120,43 @@ class RiviumAbTestingSDK {
 
   private async fetchExperiments(): Promise<void> {
     try {
-      const response = await fetch(
-        `${API_URL}/public/init?platform=react-native&sdkVersion=0.1.0`,
-        {
-          headers: { 'x-api-key': this.config!.apiKey },
-        }
+      const response = await this.request(
+        `/public/init?platform=react-native&sdkVersion=${SDK_VERSION}`
       );
 
       if (response.ok) {
         const data = await response.json();
 
-        const experimentsList = data.experiments || [];
-        this.cachedExperiments = experimentsList.map((e: any) => ({
-          id: e.id,
-          name: e.name,
-          trafficAllocation: e.trafficAllocation ?? 100,
-          variants: (e.variants || []).map((v: any) => ({
-            id: v.id,
-            name: v.name,
-            config: v.config || null,
-            isControl: v.isControl ?? false,
-            trafficSplit: v.trafficSplit ?? 50,
+        const experimentsList = (data.experiments as Array<Record<string, any>>) || [];
+        this.cachedExperiments = experimentsList.map((e) => ({
+          id: e.id as string,
+          key: (e.key as string) || undefined,
+          name: e.name as string,
+          trafficAllocation: (e.trafficAllocation as number) ?? 100,
+          variants: ((e.variants as Array<Record<string, any>>) || []).map((v) => ({
+            id: v.id as string,
+            key: (v.key as string) || undefined,
+            name: v.name as string,
+            config: (v.config as Record<string, any>) || undefined,
+            isControl: (v.isControl as boolean) ?? false,
+            trafficSplit: (v.trafficSplit as number) ?? 50,
           })),
           cachedAt: new Date().toISOString(),
         }));
 
-        await AsyncStorage.setItem(
-          `${STORAGE_PREFIX}experiments`,
+        await Storage.setItem(
+          'experiments',
           JSON.stringify(this.cachedExperiments)
         );
 
-        if (data.config) {
+        const serverConfig = data.config as Partial<SyncConfig> | undefined;
+        if (serverConfig) {
           this.syncConfig = {
             ...this.syncConfig,
-            ...data.config,
+            syncIntervalSeconds: serverConfig.syncIntervalSeconds ?? this.syncConfig.syncIntervalSeconds,
+            maxBatchSize: serverConfig.maxBatchSize ?? this.syncConfig.maxBatchSize,
+            maxOfflineEvents:
+              this.config?.maxQueueSize ?? serverConfig.maxOfflineEvents ?? this.syncConfig.maxOfflineEvents,
           };
           this.startSyncTimer();
         }
@@ -1063,9 +1189,7 @@ class RiviumAbTestingSDK {
     experimentKey: string,
     defaultVariant: string
   ): Promise<string> {
-    const experiment = this.cachedExperiments.find(
-      (e) => e.id === experimentKey
-    );
+    const experiment = this.findExperiment(experimentKey);
     if (!experiment) return defaultVariant;
 
     // Check traffic allocation
@@ -1085,10 +1209,11 @@ class RiviumAbTestingSDK {
     for (const variant of experiment.variants) {
       cumulativeSplit += variant.trafficSplit;
       if (variantBucket <= cumulativeSplit) {
-        await this.cacheAssignment({
-          experimentId: experimentKey,
+        await this.cacheAssignment(experimentKey, {
+          experimentId: experiment.id,
           variantId: variant.id,
           variantName: variant.name,
+          config: variant.config,
           assignedAt: new Date().toISOString(),
         });
 
@@ -1105,21 +1230,17 @@ class RiviumAbTestingSDK {
     return defaultVariant;
   }
 
-  private getBucket(userId: string, salt: string): number {
-    const hash = createHash(`${userId}:${salt}`);
-    const hashInt = parseInt(hash.substring(0, 8), 16);
-    return (hashInt % 100) + 1; // 1-100
-  }
-
-  // ============================================
-  // PRIVATE: APP STATE
-  // ============================================
-
   private onAppStateChange = (state: AppStateStatus): void => {
     if (state === 'background' && this.eventQueue.length > 0) {
       this.syncEvents().catch(() => {});
     }
   };
+
+  private getBucket(userId: string, salt: string): number {
+    const hash = createHash(`${userId}:${salt}`);
+    const hashInt = parseInt(hash.substring(0, 8), 16);
+    return (hashInt % 100) + 1; // 1-100
+  }
 }
 
 export const RiviumAbTesting = new RiviumAbTestingSDK();

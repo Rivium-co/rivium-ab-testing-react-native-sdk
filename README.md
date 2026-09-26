@@ -41,10 +41,17 @@ import RiviumAbTesting from 'rivium-ab-testing-react-native';
 // 1. Initialize
 await RiviumAbTesting.init({
   apiKey: 'rv_live_your_api_key',
-  debug: true,
+  // Your server mints this for the signed-in user (see "User tokens").
+  tokenProvider: async () => {
+    const res = await fetch('https://your-api.example.com/rivium-token', {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${yourSessionToken}` },
+    });
+    return (await res.json()).token;
+  },
 });
 
-// 2. Set user
+// 2. Set user (call again on login/logout; the last user's data is dropped)
 await RiviumAbTesting.setUserId('user-123');
 
 // 3. Get variant
@@ -56,6 +63,27 @@ await RiviumAbTesting.trackConversion('checkout-redesign', 49.99);
 // 5. Flush events
 await RiviumAbTesting.flush();
 ```
+
+## User tokens
+
+The API key ships inside your app, so anyone can read it. On its own it can't
+prove which user a request is for. Your server can: it holds your project's
+**server secret** and mints a short-lived token for the signed-in user
+(`POST https://auth.rivium.co/users/token`, or `createUserToken()` in
+[`rivium-ab-testing-node`](https://www.npmjs.com/package/rivium-ab-testing-node)).
+The SDK sends it with every request, and the service takes the user from the
+token instead of from the app.
+
+The SDK calls `tokenProvider` when it needs a token, again shortly before the
+token expires, and once more if the service reports it expired. Calling
+`setUserId` with a different user sends the last user's pending events first,
+then drops their variants and token.
+
+A token is **required**: assigning variants, tracking events and
+evaluating flags are refused without one (reading the experiment and flag
+lists is not, so the app can load them before anyone signs in). The same token works for Rivium Chat and Sync.
+
+**Never put the server secret in the app.**
 
 ## A/B Testing
 
@@ -195,9 +223,10 @@ unsubscribe();
 ```typescript
 await RiviumAbTesting.init({
   apiKey: 'rv_live_your_api_key',
-  debug: true,            // Enable debug logging
+  tokenProvider,          // returns a user token minted by your server
+  debug: false,           // log to the console (development only)
   flushInterval: 30000,   // Auto-flush interval in ms (default: 30000)
-  maxQueueSize: 100,      // Max events before auto-flush (default: 100)
+  maxQueueSize: 1000,     // events kept while offline (default: 1000)
 });
 ```
 
