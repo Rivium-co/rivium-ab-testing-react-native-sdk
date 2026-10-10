@@ -75,13 +75,41 @@ The SDK sends it with every request, and the service takes the user from the
 token instead of from the app.
 
 The SDK calls `tokenProvider` when it needs a token, again shortly before the
-token expires, and once more if the service reports it expired. Calling
-`setUserId` with a different user sends the last user's pending events first,
-then drops their variants and token.
+token expires, and once more if the service reports it expired. When a user
+signs out call `clearUserId()`; when another signs in call `setUserId` with
+their id. Either way the last user's variants, attributes, token and unsent
+events are dropped, on the device too, before anything is sent for the next
+one; events still waiting go out under the last user's own token, never under
+another user's.
 
-A token is **required**: assigning variants, tracking events and
-evaluating flags are refused without one (reading the experiment and flag
-lists is not, so the app can load them before anyone signs in). The same token works for Rivium Chat and Sync.
+A token is **required** for assigning variants, tracking events and
+evaluating flags (reading the experiment and flag lists is not, so the app can
+load them before anyone signs in). The service takes the user from the token,
+so the SDK does too: you may skip `setUserId` and let the token say who the
+user is. The same token works for Rivium Chat and Sync.
+
+### Before your user signs in
+
+You can start the SDK before anyone is signed in: return `null` from
+`tokenProvider` and call `refreshUserToken()` when the user signs in or out
+(or push a token yourself with `setUserToken(token)`, and `setUserToken(null)`
+on sign-out). Until it has a token the SDK waits: `getVariant` and the flag
+getters return your defaults at once, nothing is sent, and nothing is reported
+as an error. When the token arrives the SDK continues by itself.
+
+```typescript
+RiviumAbTesting.isAwaitingUserToken;             // true while it waits
+RiviumAbTesting.onAwaitingUserToken(() => {});   // called each time it starts waiting
+RiviumAbTesting.on('userTokenReady', () => {});  // a token arrived: read variants again
+await RiviumAbTesting.refreshUserToken();        // ask tokenProvider again now
+await RiviumAbTesting.setUserToken(token);       // or hand over a token (null: signed out)
+```
+
+Events tracked while it waits are kept (up to 1000, the oldest dropped first)
+and sent after sign-in **only if they were recorded for that same user**
+(`setUserId` was called with their id before the token arrived). Events
+recorded while no user was set belong to nobody, cannot be credited to anyone,
+and are dropped when a user signs in.
 
 **Never put the server secret in the app.**
 
@@ -92,9 +120,13 @@ lists is not, so the app can load them before anyone signs in). The same token w
 ```typescript
 const variant = await RiviumAbTesting.getVariant(
   'experiment-key',
-  'control' // fallback if offline and no cache
+  'control' // returned while there is no user token, or when the service
+            // cannot be reached and nothing is cached
 );
 ```
+
+The variant always comes from the service (and is cached for the user); the
+SDK never works one out on the device.
 
 ### Get Variant Config
 
@@ -212,7 +244,8 @@ const unsubscribe = RiviumAbTesting.on('experimentAssigned', (event) => {
 
 // Available events:
 // 'initialized', 'error', 'experimentAssigned', 'experimentsRefreshed',
-// 'featureFlagsRefreshed', 'syncCompleted', 'offlineMode', 'onlineMode'
+// 'featureFlagsRefreshed', 'syncCompleted', 'offlineMode', 'onlineMode',
+// 'awaitingUserToken', 'userTokenReady'
 
 // Unsubscribe
 unsubscribe();
@@ -226,7 +259,7 @@ await RiviumAbTesting.init({
   tokenProvider,          // returns a user token minted by your server
   debug: false,           // log to the console (development only)
   flushInterval: 30000,   // Auto-flush interval in ms (default: 30000)
-  maxQueueSize: 1000,     // events kept while offline (default: 1000)
+  maxQueueSize: 1000,     // events kept while they cannot be sent (default and maximum: 1000)
 });
 ```
 
@@ -249,6 +282,11 @@ await RiviumAbTesting.reset();
 |---|---|
 | `init(config)` | Initialize the SDK |
 | `setUserId(id)` | Set user ID for assignment |
+| `clearUserId()` | Sign the user out: drop their data, token and unsent events |
+| `isAwaitingUserToken` | `true` while the SDK waits for a user token |
+| `onAwaitingUserToken(callback)` | Called each time the SDK starts waiting; returns an unsubscribe function |
+| `setUserToken(token)` | Hand over a user token; `null` when the user signs out |
+| `refreshUserToken()` | Ask `tokenProvider` again (call on sign-in and sign-out) |
 | `getUserId()` | Get current user ID |
 | `setUserAttributes(attrs)` | Set targeting attributes |
 | `getVariant(key)` | Get assigned variant |

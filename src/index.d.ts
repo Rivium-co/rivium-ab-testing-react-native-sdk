@@ -7,12 +7,18 @@ export interface RiviumAbTestingConfig {
    * service then takes the user from the token instead of trusting the userId
    * this app sends. Called when a token is needed and again shortly before it
    * expires. Required for assigning variants, tracking events and evaluating flags.
+   *
+   * Return `null` when no one is signed in, and call `refreshUserToken()` when
+   * the user signs in or out. Until there is a token the SDK waits
+   * (`isAwaitingUserToken`): variants and flags return your defaults and
+   * events are kept, nothing is sent.
    */
-  tokenProvider?: () => string | Promise<string>;
+  tokenProvider?: () => string | null | undefined | Promise<string | null | undefined>;
   /** A user token you already hold. `tokenProvider` is preferred: a static token expires. */
   userToken?: string;
   debug?: boolean;
   flushInterval?: number;
+  /** Most events kept while they cannot be sent. Default and maximum 1000. */
   maxQueueSize?: number;
   autoTrack?: boolean;
 }
@@ -88,7 +94,11 @@ export type RiviumAbTestingEventType =
   | 'featureFlagsRefreshed'
   | 'syncCompleted'
   | 'offlineMode'
-  | 'onlineMode';
+  | 'onlineMode'
+  /** The SDK started waiting for a user token (see `isAwaitingUserToken`). */
+  | 'awaitingUserToken'
+  /** A user token arrived, or the signed-in user changed: read variants again. */
+  | 'userTokenReady';
 
 export interface RiviumAbTestingEvent {
   type: RiviumAbTestingEventType;
@@ -103,8 +113,36 @@ declare class RiviumAbTestingSDK {
 
   // User management
   setUserId(userId: string): Promise<void>;
+  /**
+   * Signs the user out of the SDK: drops their variants, attributes, token,
+   * unsent events and stored id. Call it on logout so the next user of this
+   * device starts clean.
+   */
+  clearUserId(): Promise<void>;
   getUserId(): Promise<string | null>;
   setUserAttributes(attributes: Record<string, any>): Promise<void>;
+
+  // User token
+  /**
+   * True while the SDK is waiting for a user token: no one is signed in yet,
+   * or the token was refused. Variants and flags return your defaults and
+   * events are kept, nothing is sent. The SDK continues by itself after
+   * `setUserToken()` or `refreshUserToken()`.
+   */
+  readonly isAwaitingUserToken: boolean;
+  /** Called when the SDK starts waiting for a user token. */
+  onAwaitingUserToken(callback: () => void): () => void;
+  /**
+   * Replace the user token, or pass `null` when the user signs out. The SDK
+   * continues if it was waiting for a token, and starts clean if the token is
+   * for a different user.
+   */
+  setUserToken(token: string | null): Promise<void>;
+  /**
+   * Ask `tokenProvider` again. Call this when the user signs in or out; the
+   * SDK then continues as that user, or waits if there is none.
+   */
+  refreshUserToken(): Promise<void>;
 
   // Experiment assignment
   getVariant(experimentKey: string, defaultVariant?: string): Promise<string>;
