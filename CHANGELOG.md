@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.2.3
+
+- Follows the list cache set in the Rivium console: the experiment list is asked for again once it is older than the console allows.
+- A `flushInterval` you pass now wins over the console's send interval; leave it out to follow the console. Changes apply without a restart.
+- Sends each event's own time as milliseconds.
+
 ## 0.2.2
 
 - Waits for a user token when the app starts before sign-in: `getVariant` and the flag getters return your defaults and events are kept until a token arrives. New `isAwaitingUserToken`, `onAwaitingUserToken()`, `setUserToken()` and `refreshUserToken()`; `tokenProvider` may return `null`.

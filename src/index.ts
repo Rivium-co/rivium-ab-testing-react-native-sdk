@@ -2,7 +2,7 @@ import { AppState, type AppStateStatus } from 'react-native';
 import { Storage } from './storage';
 
 const API_URL = 'https://abtest.rivium.co';
-const SDK_VERSION = '0.2.2';
+const SDK_VERSION = '0.2.3';
 /** Fetch a new user token this many seconds before the current one expires. */
 const TOKEN_REFRESH_SKEW_S = 60;
 /** While waiting for a user token, ask `tokenProvider` again at most this often. */
@@ -65,6 +65,11 @@ export interface RiviumAbTestingConfig {
   /** A user token you already hold. `tokenProvider` is preferred: a static token expires. */
   userToken?: string;
   debug?: boolean;
+  /**
+   * How often queued events are sent, in milliseconds. Leave it out to follow
+   * the send interval set in the Rivium console (30000 until the console's
+   * value is known). A value you pass is your own choice and is always used.
+   */
   flushInterval?: number;
   /** Most events kept while they cannot be sent. Default and maximum 1000. */
   maxQueueSize?: number;
@@ -218,6 +223,26 @@ function tokenClaims(token: string): { exp?: unknown; sub?: unknown } {
   }
 }
 
+const DEFAULT_LIST_CACHE_S = 300;
+/** After a list refresh that failed, the next one waits this long. */
+const LIST_RETRY_MS = 60_000;
+// Whatever the console says, events are never sent more often than every 10
+// seconds and the experiment list is never asked for more than once a minute.
+const SEND_INTERVAL_BOUNDS_S: [number, number] = [10, 3600];
+const LIST_CACHE_BOUNDS_S: [number, number] = [60, 86_400];
+
+/** A whole number of seconds from the service, brought inside the bounds; undefined when it is not one. */
+function boundedSeconds(value: unknown, [min, max]: [number, number]): number | undefined {
+  if (typeof value !== 'number' || !Number.isInteger(value) || value < 1) return undefined;
+  return Math.min(Math.max(value, min), max);
+}
+
+/** The time an event was recorded, as milliseconds since 1970. */
+function eventTimeMs(timestamp: string): number | string {
+  const ms = Date.parse(timestamp);
+  return Number.isFinite(ms) ? ms : timestamp;
+}
+
 // ============================================
 // SDK IMPLEMENTATION
 // ============================================
@@ -267,6 +292,15 @@ class RiviumAbTestingSDK {
   private refusedUserToken?: string;
   private lastProviderAsk = 0;
 
+  // What the console says about sending and caching.
+  /** True when the app passed its own `flushInterval`: it wins over the console's send interval. */
+  private ownFlushInterval = false;
+  /** How long the experiment list is used before the service is asked again. */
+  private listCacheSeconds = DEFAULT_LIST_CACHE_S;
+  private listFetchedAt = 0;
+  private listRetryAt = 0;
+  private listLoads = 0;
+
   // ============================================
   // INITIALIZATION
   // ============================================
@@ -281,6 +315,7 @@ class RiviumAbTestingSDK {
 
     // Start sync timer
     const interval = config.flushInterval || 30000;
+    this.ownFlushInterval = !!config.flushInterval;
     this.syncConfig.syncIntervalSeconds = Math.max(1, Math.floor(interval / 1000));
     this.syncConfig.maxOfflineEvents = this.queueLimit(config.maxQueueSize);
     this.trimQueue();
@@ -414,6 +449,7 @@ class RiviumAbTestingSDK {
     defaultVariant: string = 'control'
   ): Promise<string> {
     if (!this.ready('getVariant')) return defaultVariant;
+    this.refreshListIfStale();
 
     const assignment = await this.assignmentFor(experimentKey);
     return assignment ? assignment.variantName : defaultVariant;
@@ -797,6 +833,10 @@ class RiviumAbTestingSDK {
     this.assignInFlight.clear();
     this.eventQueue = [];
     this.isInitialized = false;
+    this.ownFlushInterval = false;
+    this.listCacheSeconds = DEFAULT_LIST_CACHE_S;
+    this.listFetchedAt = 0;
+    this.listRetryAt = 0;
     this.forgetUserToken();
     this.awaitingUserToken = false;
     this.tokenProviderFailed = false;
@@ -1397,6 +1437,7 @@ class RiviumAbTestingSDK {
     }
   ): Promise<void> {
     if (!this.ready('track')) return;
+    this.refreshListIfStale();
 
     // Get variant ID from cached assignment
     const cached = this.userId ? this.assignments.get(experimentKey) : undefined;
@@ -1581,7 +1622,7 @@ class RiviumAbTestingSDK {
           eventName: e.eventName,
           eventValue: e.eventValue,
           metadata: e.metadata,
-          timestamp: e.timestamp,
+          timestamp: eventTimeMs(e.timestamp),
           clientEventId: e.id,
         })),
         sdkVersion: `react-native-${SDK_VERSION}`,
@@ -1603,7 +1644,24 @@ class RiviumAbTestingSDK {
   // PRIVATE: EXPERIMENTS
   // ============================================
 
-  private async fetchExperiments(): Promise<void> {
+  /**
+   * The experiment list is older than the console allows: ask again in the
+   * background. The caller is never kept waiting and goes on with the list it
+   * has. Nothing is asked while a load is already running.
+   */
+  private refreshListIfStale(): void {
+    if (this.listLoads > 0) return;
+    const now = Date.now();
+    if (now < this.listRetryAt) return;
+    const age = now - this.listFetchedAt;
+    if (age >= 0 && age < this.listCacheSeconds * 1000) return;
+    this.fetchExperiments(true).catch(() => {});
+  }
+
+  /** `quiet`: a failure is not reported (a refresh the app did not ask for). */
+  private async fetchExperiments(quiet = false): Promise<void> {
+    let fetched = false;
+    this.listLoads++;
     try {
       const response = await this.send(
         `/public/init?platform=react-native&sdkVersion=${SDK_VERSION}`
@@ -1634,12 +1692,20 @@ class RiviumAbTestingSDK {
           JSON.stringify(this.cachedExperiments)
         );
 
-        const serverConfig = data.config as Partial<SyncConfig> | undefined;
+        this.listFetchedAt = Date.now();
+        fetched = true;
+
+        const serverConfig = data.config as (Partial<SyncConfig> & { cacheTtlSeconds?: unknown }) | undefined;
         if (serverConfig) {
           const interval = this.syncConfig.syncIntervalSeconds;
+          this.listCacheSeconds =
+            boundedSeconds(serverConfig.cacheTtlSeconds, LIST_CACHE_BOUNDS_S) ?? this.listCacheSeconds;
           this.syncConfig = {
             ...this.syncConfig,
-            syncIntervalSeconds: serverConfig.syncIntervalSeconds ?? interval,
+            // The app's own interval wins; otherwise the console's, inside the bounds.
+            syncIntervalSeconds: this.ownFlushInterval
+              ? interval
+              : boundedSeconds(serverConfig.syncIntervalSeconds, SEND_INTERVAL_BOUNDS_S) ?? interval,
             maxBatchSize: Math.max(
               1,
               Math.min(serverConfig.maxBatchSize ?? this.syncConfig.maxBatchSize, MAX_BATCH_SIZE)
@@ -1662,9 +1728,14 @@ class RiviumAbTestingSDK {
       }
     } catch (e) {
       this.debugLog('Failed to fetch experiments:', e);
-      this.emit('error', {
-        message: `Failed to fetch experiments: ${e}`,
-      });
+      if (!quiet) {
+        this.emit('error', {
+          message: `Failed to fetch experiments: ${e}`,
+        });
+      }
+    } finally {
+      this.listLoads--;
+      this.listRetryAt = fetched ? 0 : Date.now() + LIST_RETRY_MS;
     }
   }
 

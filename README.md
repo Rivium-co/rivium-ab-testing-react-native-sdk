@@ -258,7 +258,7 @@ await RiviumAbTesting.init({
   apiKey: 'rv_live_your_api_key',
   tokenProvider,          // returns a user token minted by your server
   debug: false,           // log to the console (development only)
-  flushInterval: 30000,   // Auto-flush interval in ms (default: 30000)
+  flushInterval: 30000,   // Auto-flush interval in ms. Leave it out to follow the send interval set in the Rivium console
   maxQueueSize: 1000,     // events kept while they cannot be sent (default and maximum: 1000)
 });
 ```

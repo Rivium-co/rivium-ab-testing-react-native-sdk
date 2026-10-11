@@ -1,6 +1,6 @@
 {
   "name": "rivium-ab-testing-react-native",
-  "version": "0.2.2",
+  "version": "0.2.3",
   "description": "Rivium A/B Testing SDK for React Native - Pure TypeScript, no native modules required",
   "main": "src/index.ts",
   "types": "src/index.d.ts",

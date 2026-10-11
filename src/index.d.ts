@@ -17,6 +17,11 @@ export interface RiviumAbTestingConfig {
   /** A user token you already hold. `tokenProvider` is preferred: a static token expires. */
   userToken?: string;
   debug?: boolean;
+  /**
+   * How often queued events are sent, in milliseconds. Leave it out to follow
+   * the send interval set in the Rivium console (30000 until the console's
+   * value is known). A value you pass is your own choice and is always used.
+   */
   flushInterval?: number;
   /** Most events kept while they cannot be sent. Default and maximum 1000. */
   maxQueueSize?: number;
